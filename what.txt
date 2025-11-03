@@ -1,0 +1,7 @@
+Analyze historical gold price data (XAU/USD).
+
+Predict potential market direction (buy/sell/hold).
+
+Give you entry signals (entry price, stop loss, take profit).
+
+Optionally, integrate with a broker’s API (like MetaTrader5, OANDA, or Binance) for live execution.
