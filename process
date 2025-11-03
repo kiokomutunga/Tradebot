@@ -1,0 +1,347 @@
+Design: AI trading pipeline (1H XAU/USD)
+1. High-level flow
+
+Data ingestion — load hourly OHLCV.
+
+Cleaning — resample/fill missing, timezone fix.
+
+Feature engineering — indicators, returns, price patterns, context (DXY).
+
+Labeling — define target (binary/multi) with forward horizon & threshold.
+
+Train/validate — use time-aware splits + walk-forward (rolling).
+
+Modeling — XGBoost / LightGBM as baseline; LSTM/CNN later.
+
+Thresholding & calibration — convert probabilities to trade signals.
+
+Backtesting — realistic execution, slippage, spreads, fees, position sizing.
+
+Paper trading / Live — connect to broker API for signals/execution.
+
+Monitoring — P&L, drawdown, model drift; retrain schedule.
+
+2. Data & preprocessing
+
+Required columns: datetime, open, high, low, close, volume (index = datetime).
+
+Ensure uniform hourly spacing: df = df.asfreq('1H') then interpolate() or forward-fill small gaps.
+
+Remove daylight time issues (use UTC).
+
+Example:
+
+import pandas as pd
+df = pd.read_csv("gold_data.csv", index_col=0, parse_dates=True)
+df = df.sort_index()
+df = df.tz_localize(None).asfreq("1H")
+df = df.fillna(method="ffill")  # small gaps OK; for long gaps drop
+
+3. Feature engineering (core set)
+
+Create features that capture momentum, trend, volatility, and structure.
+
+Basic price features
+
+returns: r1 = close.pct_change()
+
+log returns
+
+Trend / MAs
+
+EMA fast/slow: 12, 26, 50, 200
+
+SMA 20, 50
+
+Momentum
+
+RSI(14)
+
+Stochastic %K/%D
+
+Volatility
+
+ATR(14)
+
+rolling std of returns (window 20)
+
+Mean reversion / bands
+
+Bollinger Bands (20,2): bb_high, bb_low, bb_pct = (close - bb_mid)/(bb_high-bb_low)
+
+Price action & structure
+
+previous candle body size, upper/lower wick ratios
+
+HH/LL breakout flags vs n-period high/low (n=24,48)
+
+Context
+
+DXY (USD index), US10Y, VIX (if available) aligned to same frequency
+
+Time features
+
+hour of day, day of week, is_market_open (some FX/commodity seasonality)
+
+Use ta or pandas to compute.
+
+Example snippet:
+
+import ta
+df['ema12'] = ta.trend.ema_indicator(df['Close'], window=12)
+df['rsi14'] = ta.momentum.rsi(df['Close'], window=14)
+df['atr14'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+df['bb_high'] = ta.volatility.bollinger_hband(df['Close'], window=20, window_dev=2)
+...
+
+4. Labeling (how you define a trade)
+
+Key idea: label sample t using future price movement over horizon H with threshold T.
+
+Options:
+
+Binary: 1 if future_return >= T (buy), 0 otherwise.
+
+Ternary: 1 buy (>=T), -1 sell (<= -T), 0 hold (between).
+
+Regression: predict future return, then threshold.
+
+Recommended for short-term 1H:
+
+H = 6 (next 6 hours) or H = 12 (12 hours), tune later.
+
+T = 0.003 (0.3%) — adjust based on ATR and spread.
+
+Label code:
+
+H = 6
+T = 0.003
+df['future_close'] = df['Close'].shift(-H)
+df['future_return'] = df['future_close'] / df['Close'] - 1
+df['label'] = 0
+df.loc[df['future_return'] >= T, 'label'] = 1
+df.loc[df['future_return'] <= -T, 'label'] = -1  # if ternary
+
+
+Handle lookahead: drop last H rows.
+
+5. Class balance & sample weighting
+
+Short-term labels can be imbalanced. Track class ratios.
+
+Use class_weight for tree models or oversample minority with time-series aware methods (avoid random oversampling across time).
+
+Better: use thresholded probability + no-trade zone to reduce false trades.
+
+6. Modeling approach
+
+Baseline: XGBoost / LightGBM (fast, interpretable, handles missing).
+
+Advanced: stacked models (GBM + small NN); LSTM/Transformer for sequence patterns.
+
+Training pipeline:
+
+Scale only where needed (tree models don't require scaling).
+
+Use features from t only (no future features).
+
+Simple XGBoost example:
+
+from xgboost import XGBClassifier
+features = ['rsi14','ema12','ema26','atr14','bb_pct','hour','dxy_change']
+X = df[features].dropna()
+y = df['label'].loc[X.index]
+train_idx = int(len(X)*0.7)
+X_train, X_test = X[:train_idx], X[train_idx:]
+y_train, y_test = y[:train_idx], y[train_idx:]
+
+model = XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.03, subsample=0.8)
+model.fit(X_train, y_train)
+
+7. Validation: Rolling / Walk-forward CV (must)
+
+Never randomize time series. Use rolling window:
+
+Example procedure:
+
+Window sizes: train 6 months → test 1 month → roll forward by 1 month.
+
+Collect metrics per fold: return, Sharpe, drawdown, accuracy, precision per class.
+
+Use average + variance across folds to assess stability.
+
+Pseudo:
+
+for start in range(0, len(df)-train_len-test_len, step):
+    train = df[start:start+train_len]
+    test = df[start+train_len:start+train_len+test_len]
+    fit on train, evaluate on test
+
+8. Decision thresholding & confidence
+
+Model outputs probabilities — convert to trades with threshold p0. Use no-trade zone:
+
+if p_buy >= 0.65 => BUY
+
+if p_sell >= 0.65 => SELL
+
+else: HOLD
+
+Tune p0 with validation to maximize expected return, not just accuracy.
+
+9. Backtesting (realistic)
+
+Key details:
+
+Simulate mid price or bid/ask; include spread and slippage.
+
+Account for commission (per lot) and overnight financing (for CFDs).
+
+Use position sizing: fixed risk per trade (e.g., 0.5% of equity) using ATR for stop distance.
+
+Stop Loss & Take Profit: use ATR multiples (SL = 1×ATR, TP = 2×ATR) or previous structure (swing high/low).
+
+Use time of day filters (avoid low-liquidity hours).
+
+Backtest library suggestions: backtesting.py, vectorbt.
+
+Minimal custom backtest logic:
+
+# pseudo: for each signal row
+if signal == 1 and not in_position:
+    entry = close*(1 + spread)
+    sl = entry - atr*1.0
+    tp = entry + atr*2.0
+    position = {"entry": entry, "sl": sl, "tp": tp}
+# update each bar: check sl/tp hit
+
+
+Evaluate: net P/L, win rate, profit factor, max drawdown, Sharpe.
+
+10. Risk management & position sizing
+
+Risk per trade: r = 0.5% of account equity.
+
+Position size = risk_amount / (entry - SL) * contract_size.
+
+Max concurrent positions: 1 or small number.
+
+Max daily drawdown stop: e.g., 5% — pause trading for day if exceeded.
+
+11. Retraining & model lifecycle
+
+Retrain weekly/monthly depending on strategy stability.
+
+Use online update if model supports incremental training (e.g., LightGBM with continued boosting).
+
+Monitor feature drift; if performance drops, retrain or switch strategy.
+
+12. Deployment & live signals
+
+Create a signal server: script polls latest candle every hour, computes features, produces prob, applies threshold, writes signal to DB or sends webhook.
+
+Broker integration (optional): MetaTrader5 / OANDA / Interactive Brokers — use their REST/SDK to place orders.
+
+For safety, start with paper trading.
+
+13. Explainability & monitoring
+
+Use SHAP for tree models to inspect feature importance.
+
+Log signals & trades, keep traceability: feature snapshot + model version per signal.
+
+Dashboard: P&L, rolling performance, confusion matrices per period.
+
+14. Folder structure (recommended)
+xau_trader/
+├─ data/
+│  ├─ raw/                # raw CSVs
+│  └─ processed/
+├─ notebooks/
+├─ src/
+│  ├─ ingest.py
+│  ├─ features.py
+│  ├─ label.py
+│  ├─ train.py
+│  ├─ backtest.py
+│  └─ live.py
+├─ models/
+├─ logs/
+├─ requirements.txt
+└─ README.md
+
+15. Minimal end-to-end code skeleton
+
+(This is a compact runnable skeleton — adapt features and hyperparams.)
+
+# src/features.py
+import pandas as pd
+import ta
+
+def make_features(df):
+    df['return1'] = df['Close'].pct_change()
+    df['ema12'] = ta.trend.ema_indicator(df['Close'], window=12)
+    df['ema26'] = ta.trend.ema_indicator(df['Close'], window=26)
+    df['rsi14'] = ta.momentum.rsi(df['Close'], window=14)
+    df['atr14'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+    df['bb_pct'] = (df['Close'] - ta.volatility.bollinger_mavg(df['Close'], window=20)) / (ta.volatility.bollinger_hband(df['Close']) - ta.volatility.bollinger_lband(df['Close']))
+    df = df.dropna()
+    return df
+
+# src/label.py
+def label_future(df, H=6, T=0.003):
+    df['future'] = df['Close'].shift(-H)
+    df['fret'] = df['future'] / df['Close'] - 1
+    df['label'] = 0
+    df.loc[df['fret'] >= T, 'label'] = 1
+    df.loc[df['fret'] <= -T, 'label'] = -1
+    df = df.dropna()
+    return df
+
+# src/train.py
+from xgboost import XGBClassifier
+from sklearn.metrics import classification_report
+def train_model(df, features):
+    train_split = int(len(df)*0.7)
+    X_train = df[features].iloc[:train_split]
+    y_train = df['label'].iloc[:train_split]
+    X_test = df[features].iloc[train_split:]
+    y_test = df['label'].iloc[train_split:]
+    model = XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.03)
+    model.fit(X_train, y_train)
+    print(classification_report(y_test, model.predict(X_test)))
+    return model
+
+16. Metrics to track (prioritize)
+
+Net return, CAGR
+
+Sharpe ratio (annualized)
+
+Max drawdown
+
+Profit factor
+
+Win rate, Average win/loss
+
+Trades per period (liquidity)
+
+17. Practical tips to approach 80%+ "correctness"
+
+Aim for high-precision signals (fewer trades, higher confidence). 80% accuracy often means you accept fewer trades with high p.
+
+Use ensemble + probability threshold >0.7 to get high-confidence picks.
+
+Use tight stop management and asymmetric TP/SL (bigger winners).
+
+Monitor regime changes; performance can collapse when regime shifts occur.
+
+18. Next immediate actions I can provide right now
+
+Pick one (I'll produce full code/notebook for that action):
+
+A complete Jupyter notebook implementing the pipeline (ingest → features → label → XGBoost train → walk-forward evaluation → simple backtest).
+
+A ready-to-run script that produces hourly signals (tries GC=F then GLD), saves features and model artifact.
+
+A backtesting script that simulates entry/exit with slippage/fees and outputs performance metrics and charts.

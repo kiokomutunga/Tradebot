@@ -5,3 +5,24 @@ Predict potential market direction (buy/sell/hold).
 Give you entry signals (entry price, stop loss, take profit).
 
 Optionally, integrate with a broker’s API (like MetaTrader5, OANDA, or Binance) for live execution.
+
+Technical indicators: RSI, MACD, Bollinger Bands, Moving Averages, ATR, Stochastic
+
+Price action: candlestick patterns, previous highs/lows, returns
+
+Momentum & volatility: standard deviation, rate of change, ATR bands
+
+
+
+Gradient Boosting Models (XGBoost, LightGBM, CatBoost)
+
+Neural Networks (LSTM or CNN) for time series
+
+Stacking Models — combine multiple models’ predictions
+
+
+from xgboost import XGBClassifier
+
+model = XGBClassifier(n_estimators=500, learning_rate=0.05, max_depth=5, subsample=0.8)
+model.fit(X_train, y_train)
+preds = model.predict(X_test)
